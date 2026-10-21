@@ -104,14 +104,14 @@ en `.env.test` (plantilla: `.env.test.example`).
 - [x] Diseño del sistema de navegación
 - [x] Esquema de base de datos (Prisma)
 - [x] Páginas de todos los módulos
-- [ ] CRUD Afiliados con formularios
-- [ ] CRUD Actas con editor de texto
-- [ ] CRUD Proyectos con barra de progreso
-- [ ] CRUD Tesorería con gráficas (Recharts)
-- [ ] CRUD Comunicados
-- [ ] Calendario interactivo completo
-- [ ] Sistema de autenticación (NextAuth)
-- [ ] Generación de informes PDF
+- [x] CRUD Afiliados con formularios
+- [x] CRUD Actas con editor de texto
+- [x] CRUD Proyectos con barra de progreso
+- [x] CRUD Tesorería con gráficas (Recharts)
+- [x] CRUD Comunicados
+- [x] Calendario interactivo completo
+- [x] Sistema de autenticación (NextAuth)
+- [x] Generación de informes PDF
 - [ ] Notificaciones por WhatsApp/SMS
 
 ---
