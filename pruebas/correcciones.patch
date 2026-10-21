@@ -1,0 +1,193 @@
+--- /dev/null
++++ b/src/lib/sanitizar.ts
+@@ -0,0 +1,14 @@
++// Deja pasar solo valores escalares del body y descarta campos sensibles.
++// Evita la "asignación masiva": que un cliente envíe { jac: { connect: { id } } },
++// { cuotas: { deleteMany: {} } }, "id", etc. y Prisma lo ejecute como escritura anidada.
++const PROHIBIDOS = new Set(["id", "jac", "jacId", "afiliado", "afiliadoId", "cuotas", "password", "createdAt", "updatedAt"]);
++
++export function soloCamposEscalares(body: Record<string, unknown> | null | undefined): Record<string, unknown> {
++  const salida: Record<string, unknown> = {};
++  for (const [clave, valor] of Object.entries(body ?? {})) {
++    if (PROHIBIDOS.has(clave)) continue;
++    if (valor !== null && typeof valor === "object") continue; // bloquea {connect}, {create}, arrays, etc.
++    salida[clave] = valor;
++  }
++  return salida;
++}
+--- a/src/lib/authOptions.ts
++++ b/src/lib/authOptions.ts
+@@ -57,20 +57,22 @@
+         }
+ 
+         // ── LOGIN COMUNERO ──
+-        // La cédula es única a nivel global, así que basta con buscar
+-        // el afiliado por cédula (no se exige jacId en el login).
++        // La cédula es única solo por junta (jacId + cédula): se buscan todas las
++        // coincidencias y se valida la contraseña contra cada una.
+         if (!credentials.cedula) return null;
+ 
+-        const afiliado = await prisma.afiliado.findFirst({
+-          where: {
+-            cedula: credentials.cedula.trim(),
+-          },
++        const candidatos = await prisma.afiliado.findMany({
++          where: { cedula: credentials.cedula.trim(), activo: true },
+           include: { jac: true },
+         });
+ 
+-        if (!afiliado || !afiliado.activo) return null;
+-        const ok = await bcrypt.compare(credentials.password, afiliado.password);
+-        if (!ok) return null;
++        // La cédula solo es única dentro de cada junta: se acepta el afiliado
++        // cuya contraseña coincide (así una misma cédula puede existir en dos juntas).
++        let afiliado: (typeof candidatos)[number] | null = null;
++        for (const c of candidatos) {
++          if (await bcrypt.compare(credentials.password, c.password)) { afiliado = c; break; }
++        }
++        if (!afiliado) return null;
+ 
+         return {
+           id:        afiliado.id,
+--- a/src/app/api/actas/[id]/route.ts
++++ b/src/app/api/actas/[id]/route.ts
+@@ -2,6 +2,7 @@
+ import { getServerSession } from "next-auth";
+ import { authOptions } from "@/lib/authOptions";
+ import { prisma } from "@/lib/prisma";
++import { soloCamposEscalares } from "@/lib/sanitizar";
+ 
+ const ROLES_DIRECTIVA = ["PRESIDENTE", "VICEPRESIDENTE", "TESORERO", "FISCAL"];
+ 
+@@ -41,7 +42,7 @@
+   const acta = await prisma.acta.update({
+     where: { id },
+     data: {
+-      ...dataSegura,
++      ...soloCamposEscalares(dataSegura),
+       fecha: body.fecha ? new Date(body.fecha) : undefined,
+       asistentes: body.asistentes ? Number(body.asistentes) : undefined,
+     },
+--- a/src/app/api/comunicados/[id]/route.ts
++++ b/src/app/api/comunicados/[id]/route.ts
+@@ -2,6 +2,7 @@
+ import { getServerSession } from "next-auth";
+ import { authOptions } from "@/lib/authOptions";
+ import { prisma } from "@/lib/prisma";
++import { soloCamposEscalares } from "@/lib/sanitizar";
+ 
+ const ROLES_DIRECTIVA = ["PRESIDENTE", "VICEPRESIDENTE", "TESORERO", "FISCAL"];
+ 
+@@ -30,7 +31,7 @@
+ 
+   const comunicado = await prisma.comunicado.update({
+     where: { id },
+-    data: { ...dataSegura, fechaPublic: body.publicado ? new Date() : null },
++    data: { ...soloCamposEscalares(dataSegura), fechaPublic: body.publicado ? new Date() : null },
+   });
+   return NextResponse.json(comunicado);
+ }
+--- a/src/app/api/afiliados/[id]/route.ts
++++ b/src/app/api/afiliados/[id]/route.ts
+@@ -2,6 +2,7 @@
+ import { getServerSession } from "next-auth";
+ import { authOptions } from "@/lib/authOptions";
+ import { prisma } from "@/lib/prisma";
++import { soloCamposEscalares } from "@/lib/sanitizar";
+ 
+ // Quiénes pueden VER el detalle de un afiliado (directiva completa, incluido Secretario
+ // porque puede "ver todo"; el propio comunero no entra por esta ruta administrativa).
+@@ -61,7 +62,7 @@
+   const { cedula: _c, password: _p, codigoJAC: _code, jacId: _jac, activo, motivoRetiro, ...data } = body;
+ 
+   const updateData: Record<string, unknown> = {
+-    ...data,
++    ...soloCamposEscalares(data),
+     vigenciaHasta: data.vigenciaHasta ? new Date(data.vigenciaHasta) : null,
+   };
+ 
+--- a/src/app/api/afiliados/route.ts
++++ b/src/app/api/afiliados/route.ts
+@@ -21,10 +21,16 @@
+ 
+     // El SUPER_ADMIN (alcaldía) ve todas las juntas.
+     // El resto de roles administrativos (incluido Secretario) solo ven la suya.
++    const ROLES_LISTAR = ["SUPER_ADMIN", "PRESIDENTE", "VICEPRESIDENTE", "TESORERO", "FISCAL", "SECRETARIO"];
++    if (!ROLES_LISTAR.includes(rol)) {
++      return NextResponse.json({ error: "No autorizado" }, { status: 403 });
++    }
++
+     const where = rol === "SUPER_ADMIN" ? {} : { jacId };
+ 
+     const afiliados = await prisma.afiliado.findMany({
+       where,
++      omit: { password: true }, // nunca devolver el hash
+       orderBy: { createdAt: "desc" },
+       include: {
+         cuotas: {
+--- a/src/app/api/admin-users/route.ts
++++ b/src/app/api/admin-users/route.ts
+@@ -30,6 +30,10 @@
+       return NextResponse.json({ error: "Tu usuario no tiene una junta asignada" }, { status: 400 });
+     }
+ 
++    if (!["PRESIDENTE", "VICEPRESIDENTE", "TESORERO", "FISCAL", "SECRETARIO"].includes(rolSesion)) {
++      return NextResponse.json({ error: "No autorizado" }, { status: 403 });
++    }
++
+     const equipo = await prisma.adminUser.findMany({
+       where: { jacId: jacIdSesion },
+       orderBy: { createdAt: "asc" },
+--- a/src/app/api/debug/test-login/route.ts
++++ /dev/null
+@@ -1,49 +0,0 @@
+-import { NextResponse } from "next/server";
+-import bcrypt from "bcryptjs";
+-
+-// RUTA TEMPORAL DE DIAGNÓSTICO — bórrala cuando termines de debuggear.
+-// Pruébala visitando en el navegador:
+-// http://localhost:3000/api/debug/test-login?email=admin@garzon.gov.co&password=Admin2026*
+-
+-export async function GET(req: Request) {
+-  const { searchParams } = new URL(req.url);
+-  const email = searchParams.get("email")?.trim() ?? "";
+-  const password = searchParams.get("password") ?? "";
+-
+-  try {
+-    const { prisma } = await import("@/lib/prisma");
+-
+-    const admin = await prisma.adminUser.findUnique({
+-      where: { email },
+-    });
+-
+-    if (!admin) {
+-      return NextResponse.json({
+-        paso: "buscar admin",
+-        resultado: "NO ENCONTRADO",
+-        emailBuscado: email,
+-      });
+-    }
+-
+-    const passwordOk = await bcrypt.compare(password, admin.password);
+-
+-    return NextResponse.json({
+-      paso: "comparacion completa",
+-      adminEncontrado: true,
+-      emailEnDB: admin.email,
+-      activo: admin.activo,
+-      hashPrefix: admin.password?.slice(0, 15),
+-      passwordRecibida: password,
+-      passwordCoincide: passwordOk,
+-    });
+-  } catch (error: any) {
+-    return NextResponse.json(
+-      {
+-        paso: "ERROR DE EXCEPCIÓN",
+-        mensaje: error?.message,
+-        stack: error?.stack,
+-      },
+-      { status: 500 }
+-    );
+-  }
+-}
+\ No newline at end of file
